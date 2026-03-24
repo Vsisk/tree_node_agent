@@ -1,7 +1,7 @@
 import copy
 import unittest
 
-from node_placement import InsertStatus, PathError, PathParser, plan_nodes_by_json_path
+from node_placement import PathError, PathParser, plan_nodes_by_json_path
 
 
 class NodePlacementTest(unittest.TestCase):
@@ -42,7 +42,7 @@ class NodePlacementTest(unittest.TestCase):
         with self.assertRaises(PathError):
             PathParser.parse_json_path("$.mapping_content.bad[0]")
 
-    def test_plan_nodes_with_missing_path_nodes(self):
+    def test_output_list_with_hierarchy_order(self):
         node = {
             "name": "Tax Rule",
             "annotation": "tax calculation logic",
@@ -52,13 +52,13 @@ class NodePlacementTest(unittest.TestCase):
         }
         result = plan_nodes_by_json_path(node, self.origin_tree, self.target_tree)
 
-        self.assertEqual(result["insert_status"], InsertStatus.INSERTED)
-        self.assertEqual(result["insert_json_path"], "$.mapping_content.children[0]")
-        self.assertEqual(len(result["nodes"]), 2)
-        self.assertEqual(result["nodes"][0]["name"], "InvoiceInfo")
-        self.assertEqual(result["nodes"][1]["name"], "Tax Rule")
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0]["path"], "$.mapping_content.children[0]")
+        self.assertEqual(result[0]["node"]["name"], "InvoiceInfo")
+        self.assertEqual(result[1]["path"], "$.mapping_content.children[0].children[0]")
+        self.assertEqual(result[1]["node"]["name"], "Tax Rule")
 
-    def test_plan_nodes_fallback_insert(self):
+    def test_fallback_insert_path(self):
         node = {
             "name": "Fallback Child",
             "annotation": "should fallback",
@@ -68,11 +68,10 @@ class NodePlacementTest(unittest.TestCase):
         }
         result = plan_nodes_by_json_path(node, self.origin_tree, self.target_tree)
 
-        self.assertEqual(result["insert_status"], InsertStatus.FALLBACK_INSERTED)
-        self.assertEqual(result["insert_json_path"], "$.mapping_content.children[0]")
-        self.assertEqual(result["nodes"][0]["name"], "InvoiceInfo")
+        self.assertEqual(result[0]["path"], "$.mapping_content.children[0]")
+        self.assertEqual(result[1]["path"], "$.mapping_content.children[0].children[0]")
 
-    def test_plan_nodes_duplicate_skipped(self):
+    def test_duplicate_skipped(self):
         target_tree = copy.deepcopy(self.target_tree)
         target_tree["children"].append(
             {
@@ -89,7 +88,6 @@ class NodePlacementTest(unittest.TestCase):
                 ],
             }
         )
-
         node = {
             "name": "Tax Rule",
             "annotation": "dup",
@@ -98,12 +96,9 @@ class NodePlacementTest(unittest.TestCase):
             "json_path": "$.mapping_content.children[0]",
         }
         result = plan_nodes_by_json_path(node, self.origin_tree, target_tree)
+        self.assertEqual(result, [])
 
-        self.assertEqual(result["insert_status"], InsertStatus.DUPLICATE_SKIPPED)
-        self.assertEqual(result["insert_json_path"], "$.mapping_content.children[0]")
-        self.assertEqual(result["nodes"], [])
-
-    def test_plan_nodes_path_invalid(self):
+    def test_path_invalid_insert_to_root(self):
         node = {
             "name": "Root Child",
             "annotation": "invalid path",
@@ -112,11 +107,9 @@ class NodePlacementTest(unittest.TestCase):
             "json_path": "$.mapping_content.children[9]",
         }
         result = plan_nodes_by_json_path(node, self.origin_tree, self.target_tree)
-
-        self.assertEqual(result["insert_status"], InsertStatus.PATH_INVALID)
-        self.assertEqual(result["insert_json_path"], "$.mapping_content")
-        self.assertEqual(len(result["nodes"]), 1)
-        self.assertEqual(result["nodes"][0]["name"], "Root Child")
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["path"], "$.mapping_content.children[0]")
+        self.assertEqual(result[0]["node"]["name"], "Root Child")
 
 
 if __name__ == "__main__":

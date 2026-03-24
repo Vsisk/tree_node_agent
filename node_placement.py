@@ -34,7 +34,8 @@ class ParsedPath:
 class BuildResult:
     candidate_parent_node: dict[str, Any]
     ancestor_chain: list[dict[str, Any]]
-    created_nodes: list[dict[str, Any]]
+    ancestor_paths: list[str]
+    created_items: list[dict[str, Any]]
 
 
 def _ensure_children(node: dict[str, Any]) -> list[dict[str, Any]]:
@@ -66,23 +67,6 @@ def _find_child_index(parent_node: dict[str, Any], child_node: dict[str, Any]) -
         if child is child_node:
             return i
     return -1
-
-
-def _build_path_string(root_name: str, ancestor_chain: list[dict[str, Any]], final_parent_node: dict[str, Any]) -> str:
-    path = f"$.{root_name}"
-    if final_parent_node is ancestor_chain[0]:
-        return path
-
-    current = ancestor_chain[0]
-    for node in ancestor_chain[1:]:
-        idx = _find_child_index(current, node)
-        if idx < 0:
-            return f"$.{root_name}"
-        path += f".children[{idx}]"
-        current = node
-        if node is final_parent_node:
-            return path
-    return f"$.{root_name}"
 
 
 class PathParser:
@@ -150,9 +134,13 @@ class TreeBuilder:
         if not _matches_node(current_tree, existing_node_chain[0]):
             raise PathError("current_tree root and existing root are not aligned")
 
+        root_path = f"$.{existing_node_chain[0].get('name', '')}"
         cursor = current_tree
+        cursor_path = root_path
+
         ancestor_chain = [current_tree]
-        created_nodes: list[dict[str, Any]] = []
+        ancestor_paths = [root_path]
+        created_items: list[dict[str, Any]] = []
 
         for existing_node in existing_node_chain[1:]:
             children = _ensure_children(cursor)
@@ -160,12 +148,24 @@ class TreeBuilder:
             if match is None:
                 match = _clone_node_metadata(existing_node)
                 children.append(match)
-                created_nodes.append(match)
+                child_index = len(children) - 1
+                match_path = f"{cursor_path}.children[{child_index}]"
+                created_items.append({"path": match_path, "node": match})
+            else:
+                child_index = _find_child_index(cursor, match)
+                match_path = f"{cursor_path}.children[{child_index}]"
 
             cursor = match
+            cursor_path = match_path
             ancestor_chain.append(cursor)
+            ancestor_paths.append(cursor_path)
 
-        return BuildResult(candidate_parent_node=cursor, ancestor_chain=ancestor_chain, created_nodes=created_nodes)
+        return BuildResult(
+            candidate_parent_node=cursor,
+            ancestor_chain=ancestor_chain,
+            ancestor_paths=ancestor_paths,
+            created_items=created_items,
+        )
 
 
 class InsertPositionResolver:
@@ -193,19 +193,22 @@ class Deduplicator:
         return False
 
 
+def _build_insert_item(parent_path: str, parent_node: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
+    insert_index = len(_ensure_children(parent_node))
+    return {
+        "path": f"{parent_path}.children[{insert_index}]",
+        "node": node,
+    }
+
+
 def plan_nodes_by_json_path(
     node: dict[str, Any],
     origin_tree: dict[str, Any],
     target_tree: dict[str, Any],
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
     """
-    对外接口：输入 node/origin_tree/target_tree。
-
-    `node` 需要包含 `json_path` 字段。
-    输出：
-    - nodes: 需要插入的一组节点（包括中间补建节点与最终 node；若重复则不含最终 node）
-    - insert_json_path: 最终需要插入的父节点 json_path
-    - insert_status: 状态
+    输出新增节点列表，格式：[{"path": "$.a.children[0]", "node": {...}}, ...]。
+    顺序保证按层级从上到下。
     """
     working_tree = deepcopy(target_tree)
     raw_json_path = node.get("json_path", "")
@@ -216,43 +219,27 @@ def plan_nodes_by_json_path(
         existing_chain = ExistingTreeLocator.locate_node_chain(origin_tree, parsed_path)
         build_result = TreeBuilder.build_path(working_tree, existing_chain)
 
-        final_parent, did_fallback, is_root = InsertPositionResolver.resolve_insert_position(
+        final_parent, _, _ = InsertPositionResolver.resolve_insert_position(
             build_result.candidate_parent_node,
             build_result.ancestor_chain,
         )
-        final_path = _build_path_string(parsed_path.root_name, build_result.ancestor_chain, final_parent)
+        parent_index = next(
+            (i for i, ancestor in enumerate(build_result.ancestor_chain) if ancestor is final_parent),
+            0,
+        )
+        final_parent_path = build_result.ancestor_paths[parent_index]
 
         if Deduplicator.is_duplicate(final_parent, payload_node):
-            return {
-                "nodes": build_result.created_nodes,
-                "insert_json_path": final_path,
-                "insert_status": InsertStatus.DUPLICATE_SKIPPED,
-            }
+            return build_result.created_items
 
-        if did_fallback:
-            status = InsertStatus.FALLBACK_INSERTED
-        elif is_root:
-            status = InsertStatus.ROOT_INSERTED
-        else:
-            status = InsertStatus.INSERTED
+        return [
+            *build_result.created_items,
+            _build_insert_item(final_parent_path, final_parent, payload_node),
+        ]
 
-        return {
-            "nodes": [*build_result.created_nodes, payload_node],
-            "insert_json_path": final_path,
-            "insert_status": status,
-        }
     except PathError:
-        root_name = origin_tree.get("name", "")
-        root_path = f"$.{root_name}"
+        root_path = f"$.{origin_tree.get('name', '')}"
         if Deduplicator.is_duplicate(working_tree, payload_node):
-            return {
-                "nodes": [],
-                "insert_json_path": root_path,
-                "insert_status": InsertStatus.DUPLICATE_SKIPPED,
-            }
+            return []
 
-        return {
-            "nodes": [payload_node],
-            "insert_json_path": root_path,
-            "insert_status": InsertStatus.PATH_INVALID,
-        }
+        return [_build_insert_item(root_path, working_tree, payload_node)]
