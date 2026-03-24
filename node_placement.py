@@ -3,8 +3,9 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
-import re
 from typing import Any
+
+from jsonpath_lib import FieldToken, IndexToken, JsonPathSyntaxError, parse as parse_jsonpath
 
 
 INSERTABLE_NODE_TYPES = {"parent", "parent_list"}
@@ -85,29 +86,36 @@ def _build_path_string(root_name: str, ancestor_chain: list[dict[str, Any]], fin
 
 
 class PathParser:
-    _ROOT_PATTERN = re.compile(r"^\$\.([A-Za-z_][A-Za-z0-9_]*)")
-    _CHILD_PATTERN = re.compile(r"\.children\[(\d+)\]")
-
     @classmethod
     def parse_json_path(cls, json_path: str) -> ParsedPath:
-        if not isinstance(json_path, str) or not json_path:
-            raise PathError("json_path must be a non-empty string")
+        try:
+            parsed = parse_jsonpath(json_path)
+        except JsonPathSyntaxError as exc:
+            raise PathError(str(exc)) from exc
 
-        root_match = cls._ROOT_PATTERN.match(json_path)
-        if not root_match:
-            raise PathError(f"invalid json_path root: {json_path}")
+        if not parsed.tokens:
+            raise PathError("json_path must contain root field")
 
-        root_name = root_match.group(1)
-        suffix = json_path[root_match.end() :]
+        first_token = parsed.tokens[0]
+        if not isinstance(first_token, FieldToken):
+            raise PathError("json_path must start with root field after '$'")
+
+        root_name = first_token.name
         child_indexes: list[int] = []
-        pos = 0
 
-        while pos < len(suffix):
-            child_match = cls._CHILD_PATTERN.match(suffix, pos)
-            if not child_match:
-                raise PathError(f"invalid children segment in json_path: {json_path}")
-            child_indexes.append(int(child_match.group(1)))
-            pos = child_match.end()
+        i = 1
+        tokens = parsed.tokens
+        while i < len(tokens):
+            token = tokens[i]
+            if not isinstance(token, FieldToken):
+                raise PathError("invalid token order in json_path")
+            if token.name != "children":
+                raise PathError(f"unsupported field in json_path: {token.name}")
+            i += 1
+            if i >= len(tokens) or not isinstance(tokens[i], IndexToken):
+                raise PathError("children field must be followed by index")
+            child_indexes.append(tokens[i].value)
+            i += 1
 
         return ParsedPath(root_name=root_name, child_indexes=child_indexes)
 
