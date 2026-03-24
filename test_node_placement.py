@@ -53,9 +53,9 @@ class NodePlacementTest(unittest.TestCase):
         result = plan_nodes_by_json_path(node, self.origin_tree, self.target_tree)
 
         self.assertEqual(len(result), 2)
-        self.assertEqual(result[0]["path"], "$.mapping_content.children[0]")
+        self.assertEqual(result[0]["path"], "$.mapping_content")
         self.assertEqual(result[0]["node"]["name"], "InvoiceInfo")
-        self.assertEqual(result[1]["path"], "$.mapping_content.children[0].children[0]")
+        self.assertEqual(result[1]["path"], "$.mapping_content.children[0]")
         self.assertEqual(result[1]["node"]["name"], "Tax Rule")
 
     def test_fallback_insert_path(self):
@@ -68,8 +68,8 @@ class NodePlacementTest(unittest.TestCase):
         }
         result = plan_nodes_by_json_path(node, self.origin_tree, self.target_tree)
 
-        self.assertEqual(result[0]["path"], "$.mapping_content.children[0]")
-        self.assertEqual(result[1]["path"], "$.mapping_content.children[0].children[0]")
+        self.assertEqual(result[0]["path"], "$.mapping_content")
+        self.assertEqual(result[1]["path"], "$.mapping_content.children[0]")
 
     def test_duplicate_skipped(self):
         target_tree = copy.deepcopy(self.target_tree)
@@ -108,7 +108,7 @@ class NodePlacementTest(unittest.TestCase):
         }
         result = plan_nodes_by_json_path(node, self.origin_tree, self.target_tree)
         self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["path"], "$.mapping_content.children[0]")
+        self.assertEqual(result[0]["path"], "$.mapping_content")
         self.assertEqual(result[0]["node"]["name"], "Root Child")
 
 

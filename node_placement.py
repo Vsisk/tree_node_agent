@@ -150,7 +150,7 @@ class TreeBuilder:
                 children.append(match)
                 child_index = len(children) - 1
                 match_path = f"{cursor_path}.children[{child_index}]"
-                created_items.append({"path": match_path, "node": match})
+                created_items.append({"path": cursor_path, "node": match})
             else:
                 child_index = _find_child_index(cursor, match)
                 match_path = f"{cursor_path}.children[{child_index}]"
@@ -194,9 +194,9 @@ class Deduplicator:
 
 
 def _build_insert_item(parent_path: str, parent_node: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
-    insert_index = len(_ensure_children(parent_node))
+    _ensure_children(parent_node)
     return {
-        "path": f"{parent_path}.children[{insert_index}]",
+        "path": parent_path,
         "node": node,
     }
 
