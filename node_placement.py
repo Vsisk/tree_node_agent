@@ -69,6 +69,10 @@ def _find_child_index(parent_node: dict[str, Any], child_node: dict[str, Any]) -
     return -1
 
 
+def _build_child_path(parent_path: str, child_index: int) -> str:
+    return f"{parent_path}.children[{child_index}]"
+
+
 class PathParser:
     @classmethod
     def parse_json_path(cls, json_path: str) -> ParsedPath:
@@ -149,11 +153,11 @@ class TreeBuilder:
                 match = _clone_node_metadata(existing_node)
                 children.append(match)
                 child_index = len(children) - 1
-                match_path = f"{cursor_path}.children[{child_index}]"
+                match_path = _build_child_path(cursor_path, child_index)
                 created_items.append({"path": cursor_path, "node": match})
             else:
                 child_index = _find_child_index(cursor, match)
-                match_path = f"{cursor_path}.children[{child_index}]"
+                match_path = _build_child_path(cursor_path, child_index)
 
             cursor = match
             cursor_path = match_path
@@ -186,11 +190,12 @@ class InsertPositionResolver:
 
 class Deduplicator:
     @staticmethod
-    def is_duplicate(parent_node: dict[str, Any], new_node: dict[str, Any]) -> bool:
-        for child in _ensure_children(parent_node):
+    def find_duplicate(parent_node: dict[str, Any], new_node: dict[str, Any]) -> tuple[dict[str, Any], int] | None:
+        for idx, child in enumerate(_ensure_children(parent_node)):
             if child.get("name") == new_node.get("name") and child.get("annotation") == new_node.get("annotation"):
-                return True
-        return False
+                return child, idx
+        return None
+
 
 
 def _build_insert_item(parent_path: str, parent_node: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
@@ -201,14 +206,32 @@ def _build_insert_item(parent_path: str, parent_node: dict[str, Any], node: dict
     }
 
 
+def _build_exist_result(parent_path: str, existing_node: dict[str, Any], existing_idx: int) -> dict[str, Any]:
+    return {
+        "is_exist": True,
+        "path": _build_child_path(parent_path, existing_idx),
+        "node": existing_node,
+    }
+
+
+def _build_insert_list_result(items: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "is_exist": False,
+        "items": items,
+    }
+
+
 def plan_nodes_by_json_path(
     node: dict[str, Any],
     origin_tree: dict[str, Any],
     target_tree: dict[str, Any],
-) -> list[dict[str, Any]]:
+) -> dict[str, Any]:
     """
-    输出新增节点列表，格式：[{"path": "$.a.children[0]", "node": {...}}, ...]。
-    顺序保证按层级从上到下。
+    若节点已存在：
+      {"is_exist": True, "path": "$.a.children[0]", "node": {...}}
+
+    若节点不存在：
+      {"is_exist": False, "items": [{"path": <parent_path>, "node": {...}}, ...]}
     """
     working_tree = deepcopy(target_tree)
     raw_json_path = node.get("json_path", "")
@@ -229,17 +252,23 @@ def plan_nodes_by_json_path(
         )
         final_parent_path = build_result.ancestor_paths[parent_index]
 
-        if Deduplicator.is_duplicate(final_parent, payload_node):
-            return build_result.created_items
+        duplicate = Deduplicator.find_duplicate(final_parent, payload_node)
+        if duplicate is not None:
+            dup_node, dup_idx = duplicate
+            return _build_exist_result(final_parent_path, dup_node, dup_idx)
 
-        return [
-            *build_result.created_items,
-            _build_insert_item(final_parent_path, final_parent, payload_node),
-        ]
+        return _build_insert_list_result(
+            [
+                *build_result.created_items,
+                _build_insert_item(final_parent_path, final_parent, payload_node),
+            ]
+        )
 
     except PathError:
         root_path = f"$.{origin_tree.get('name', '')}"
-        if Deduplicator.is_duplicate(working_tree, payload_node):
-            return []
+        duplicate = Deduplicator.find_duplicate(working_tree, payload_node)
+        if duplicate is not None:
+            dup_node, dup_idx = duplicate
+            return _build_exist_result(root_path, dup_node, dup_idx)
 
-        return [_build_insert_item(root_path, working_tree, payload_node)]
+        return _build_insert_list_result([_build_insert_item(root_path, working_tree, payload_node)])
