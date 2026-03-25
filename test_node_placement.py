@@ -58,6 +58,7 @@ class NodePlacementTest(unittest.TestCase):
         self.assertEqual(result["items"][0]["node"]["name"], "InvoiceInfo")
         self.assertEqual(result["items"][1]["path"], "$.mapping_content.children[0]")
         self.assertEqual(result["items"][1]["node"]["name"], "Tax Rule")
+        self.assertEqual(result["working_tree"]["children"][0]["children"][0]["name"], "Tax Rule")
 
     def test_fallback_insert_path(self):
         node = {
@@ -115,6 +116,30 @@ class NodePlacementTest(unittest.TestCase):
         self.assertEqual(len(result["items"]), 1)
         self.assertEqual(result["items"][0]["path"], "$.mapping_content")
         self.assertEqual(result["items"][0]["node"]["name"], "Root Child")
+
+    def test_working_tree_supports_loop_calls_without_rebuilding_previous_nodes(self):
+        first_node = {
+            "name": "Tax Rule A",
+            "annotation": "tax a",
+            "node_type": "simple_leaf",
+            "children": [],
+            "json_path": "$.mapping_content.children[0]",
+        }
+        first_result = plan_nodes_by_json_path(first_node, self.origin_tree, self.target_tree)
+
+        second_node = {
+            "name": "Tax Rule B",
+            "annotation": "tax b",
+            "node_type": "simple_leaf",
+            "children": [],
+            "json_path": "$.mapping_content.children[0]",
+        }
+        second_result = plan_nodes_by_json_path(second_node, self.origin_tree, first_result["working_tree"])
+
+        self.assertFalse(second_result["is_exist"])
+        self.assertEqual(len(second_result["items"]), 1)
+        self.assertEqual(second_result["items"][0]["path"], "$.mapping_content.children[0]")
+        self.assertEqual(second_result["working_tree"]["children"][0]["children"][1]["name"], "Tax Rule B")
 
 
 if __name__ == "__main__":

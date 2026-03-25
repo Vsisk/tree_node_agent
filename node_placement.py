@@ -206,18 +206,22 @@ def _build_insert_item(parent_path: str, parent_node: dict[str, Any], node: dict
     }
 
 
-def _build_exist_result(parent_path: str, existing_node: dict[str, Any], existing_idx: int) -> dict[str, Any]:
+def _build_exist_result(
+    parent_path: str, existing_node: dict[str, Any], existing_idx: int, working_tree: dict[str, Any]
+) -> dict[str, Any]:
     return {
         "is_exist": True,
         "path": _build_child_path(parent_path, existing_idx),
         "node": existing_node,
+        "working_tree": working_tree,
     }
 
 
-def _build_insert_list_result(items: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_insert_list_result(items: list[dict[str, Any]], working_tree: dict[str, Any]) -> dict[str, Any]:
     return {
         "is_exist": False,
         "items": items,
+        "working_tree": working_tree,
     }
 
 
@@ -228,10 +232,10 @@ def plan_nodes_by_json_path(
 ) -> dict[str, Any]:
     """
     若节点已存在：
-      {"is_exist": True, "path": "$.a.children[0]", "node": {...}}
+      {"is_exist": True, "path": "$.a.children[0]", "node": {...}, "working_tree": {...}}
 
     若节点不存在：
-      {"is_exist": False, "items": [{"path": <parent_path>, "node": {...}}, ...]}
+      {"is_exist": False, "items": [{"path": <parent_path>, "node": {...}}, ...], "working_tree": {...}}
     """
     working_tree = deepcopy(target_tree)
     raw_json_path = node.get("json_path", "")
@@ -255,13 +259,17 @@ def plan_nodes_by_json_path(
         duplicate = Deduplicator.find_duplicate(final_parent, payload_node)
         if duplicate is not None:
             dup_node, dup_idx = duplicate
-            return _build_exist_result(final_parent_path, dup_node, dup_idx)
+            return _build_exist_result(final_parent_path, dup_node, dup_idx, working_tree)
+
+        insert_item = _build_insert_item(final_parent_path, final_parent, payload_node)
+        _ensure_children(final_parent).append(payload_node)
 
         return _build_insert_list_result(
             [
                 *build_result.created_items,
-                _build_insert_item(final_parent_path, final_parent, payload_node),
-            ]
+                insert_item,
+            ],
+            working_tree,
         )
 
     except PathError:
@@ -269,6 +277,8 @@ def plan_nodes_by_json_path(
         duplicate = Deduplicator.find_duplicate(working_tree, payload_node)
         if duplicate is not None:
             dup_node, dup_idx = duplicate
-            return _build_exist_result(root_path, dup_node, dup_idx)
+            return _build_exist_result(root_path, dup_node, dup_idx, working_tree)
 
-        return _build_insert_list_result([_build_insert_item(root_path, working_tree, payload_node)])
+        insert_item = _build_insert_item(root_path, working_tree, payload_node)
+        _ensure_children(working_tree).append(payload_node)
+        return _build_insert_list_result([insert_item], working_tree)
