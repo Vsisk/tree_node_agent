@@ -3,10 +3,14 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
+import logging
+import threading
 from typing import Any
 
 from jsonpath_lib import FieldToken, IndexToken, JsonPathSyntaxError, parse as parse_jsonpath
 
+
+logger = logging.getLogger(__name__)
 
 INSERTABLE_NODE_TYPES = {"parent", "parent_list"}
 NON_INSERTABLE_NODE_TYPES = {"simple_leaf", "ab_pivot_table", "ab_two_level_table"}
@@ -18,6 +22,22 @@ class InsertStatus(Enum):
     FALLBACK_INSERTED = "fallback_inserted"
     ROOT_INSERTED = "root_inserted"
     PATH_INVALID = "path_invalid"
+
+
+class PlanStatus(Enum):
+    OK = "ok"
+    INVALID_PATH = "invalid_path"
+    INVALID_PARENT_TYPE = "invalid_parent_type"
+    PLAN_FAILED = "plan_failed"
+
+
+class CommitStatus(Enum):
+    SUCCESS = "success"
+    REPOSITIONED_AND_SUCCESS = "repositioned_and_success"
+    CONFLICT = "conflict"
+    INVALID_PATH = "invalid_path"
+    INVALID_PARENT_TYPE = "invalid_parent_type"
+    INSERT_FAILED = "insert_failed"
 
 
 class PathError(ValueError):
@@ -36,6 +56,59 @@ class BuildResult:
     ancestor_chain: list[dict[str, Any]]
     ancestor_paths: list[str]
     created_items: list[dict[str, Any]]
+
+
+@dataclass
+class InsertPlan:
+    base_version: int
+    target_json_path: str
+    resolved_parent_path: str | None
+    insert_index: int | None
+    new_node: dict[str, Any]
+    validation_summary: list[dict[str, Any]]
+    status: PlanStatus
+    message: str
+
+
+@dataclass
+class CommitResult:
+    status: CommitStatus
+    message: str
+    is_repositioned: bool
+    is_exist: bool
+    existing_path: str | None
+    existing_node: dict[str, Any] | None
+    items: list[dict[str, Any]]
+    working_tree: dict[str, Any]
+    tree_version: int
+
+
+class TreeStateManager:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._working_tree: dict[str, Any] | None = None
+        self._version = 0
+
+    def get_snapshot(self, target_tree: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        with self._lock:
+            if self._working_tree is None:
+                self._working_tree = deepcopy(target_tree)
+                self._version = 0
+            # 分析阶段基于调用方提供的快照执行，不直接读取最新树，避免隐藏并发漂移
+            return deepcopy(target_tree), self._version
+
+    def read_current_in_lock(self) -> tuple[dict[str, Any], int]:
+        if self._working_tree is None:
+            raise RuntimeError("Tree state is not initialized")
+        return self._working_tree, self._version
+
+    def set_current_in_lock(self, updated_tree: dict[str, Any]) -> int:
+        self._working_tree = updated_tree
+        self._version += 1
+        return self._version
+
+
+TREE_STATE_MANAGER = TreeStateManager()
 
 
 def _ensure_children(node: dict[str, Any]) -> list[dict[str, Any]]:
@@ -197,32 +270,246 @@ class Deduplicator:
         return None
 
 
-
 def _build_insert_item(parent_path: str, parent_node: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
     _ensure_children(parent_node)
-    return {
-        "path": parent_path,
-        "node": node,
-    }
+    return {"path": parent_path, "node": node}
 
 
-def _build_exist_result(
-    parent_path: str, existing_node: dict[str, Any], existing_idx: int, working_tree: dict[str, Any]
-) -> dict[str, Any]:
-    return {
-        "is_exist": True,
-        "path": _build_child_path(parent_path, existing_idx),
-        "node": existing_node,
-        "working_tree": working_tree,
-    }
+def _resolve_target_parent(
+    tree: dict[str, Any], origin_tree: dict[str, Any], json_path: str
+) -> tuple[BuildResult, dict[str, Any], str, list[dict[str, Any]]]:
+    parsed_path = PathParser.parse_json_path(json_path)
+    existing_chain = ExistingTreeLocator.locate_node_chain(origin_tree, parsed_path)
+
+    cursor = tree
+    for depth, idx in enumerate(parsed_path.child_indexes):
+        children = _ensure_children(cursor)
+        if idx < len(children):
+            actual = children[idx]
+            expected = existing_chain[depth + 1]
+            if not _matches_node(actual, expected):
+                raise PathError("path occupied by different node")
+            cursor = actual
+        else:
+            break
+
+    build_result = TreeBuilder.build_path(tree, existing_chain)
+
+    final_parent = build_result.candidate_parent_node
+    parent_index = len(build_result.ancestor_chain) - 1
+    final_parent_path = build_result.ancestor_paths[parent_index]
+    validation_summary = [
+        {
+            "path": build_result.ancestor_paths[i],
+            "name": node.get("name"),
+            "annotation": node.get("annotation"),
+            "node_type": node.get("node_type"),
+        }
+        for i, node in enumerate(build_result.ancestor_chain[: parent_index + 1])
+    ]
+    return build_result, final_parent, final_parent_path, validation_summary
 
 
-def _build_insert_list_result(items: list[dict[str, Any]], working_tree: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "is_exist": False,
-        "items": items,
-        "working_tree": working_tree,
-    }
+def _validate_summary_against_tree(tree: dict[str, Any], summary: list[dict[str, Any]]) -> bool:
+    if not summary:
+        return False
+    try:
+        parsed = PathParser.parse_json_path(summary[-1]["path"])
+        chain = ExistingTreeLocator.locate_node_chain(tree, parsed)
+    except Exception:
+        return False
+
+    if len(chain) != len(summary):
+        return False
+
+    for snap, node in zip(summary, chain):
+        if (
+            snap.get("name") != node.get("name")
+            or snap.get("annotation") != node.get("annotation")
+            or snap.get("node_type") != node.get("node_type")
+        ):
+            return False
+    return True
+
+
+def build_insert_plan(
+    snapshot_tree: dict[str, Any],
+    base_version: int,
+    json_path: str,
+    new_node: dict[str, Any],
+    origin_tree: dict[str, Any],
+) -> InsertPlan:
+    try:
+        _, final_parent, final_parent_path, summary = _resolve_target_parent(
+            snapshot_tree,
+            origin_tree,
+            json_path,
+        )
+    except PathError as exc:
+        return InsertPlan(
+            base_version=base_version,
+            target_json_path=json_path,
+            resolved_parent_path=None,
+            insert_index=None,
+            new_node=deepcopy(new_node),
+            validation_summary=[],
+            status=PlanStatus.INVALID_PATH,
+            message=str(exc),
+        )
+
+    if final_parent.get("node_type") not in INSERTABLE_NODE_TYPES:
+        return InsertPlan(
+            base_version=base_version,
+            target_json_path=json_path,
+            resolved_parent_path=final_parent_path,
+            insert_index=None,
+            new_node=deepcopy(new_node),
+            validation_summary=summary,
+            status=PlanStatus.INVALID_PARENT_TYPE,
+            message=f"invalid parent type: {final_parent.get('node_type')}",
+        )
+
+    insert_index = len(_ensure_children(final_parent))
+    return InsertPlan(
+        base_version=base_version,
+        target_json_path=json_path,
+        resolved_parent_path=final_parent_path,
+        insert_index=insert_index,
+        new_node=deepcopy(new_node),
+        validation_summary=summary,
+        status=PlanStatus.OK,
+        message="ok",
+    )
+
+
+def commit_insert_plan(plan: InsertPlan, origin_tree: dict[str, Any]) -> CommitResult:
+    with TREE_STATE_MANAGER._lock:
+        current_tree, current_version = TREE_STATE_MANAGER.read_current_in_lock()
+
+        logger.info(
+            "commit start base_version=%s current_version=%s status=%s",
+            plan.base_version,
+            current_version,
+            plan.status.value,
+        )
+
+        if plan.status == PlanStatus.INVALID_PATH:
+            return CommitResult(
+                status=CommitStatus.INVALID_PATH,
+                message=plan.message,
+                is_repositioned=False,
+                is_exist=False,
+                existing_path=None,
+                existing_node=None,
+                items=[],
+                working_tree=deepcopy(current_tree),
+                tree_version=current_version,
+            )
+        if plan.status == PlanStatus.INVALID_PARENT_TYPE:
+            return CommitResult(
+                status=CommitStatus.INVALID_PARENT_TYPE,
+                message=plan.message,
+                is_repositioned=False,
+                is_exist=False,
+                existing_path=None,
+                existing_node=None,
+                items=[],
+                working_tree=deepcopy(current_tree),
+                tree_version=current_version,
+            )
+
+        should_reposition = current_version != plan.base_version
+        if not should_reposition and plan.resolved_parent_path:
+            try:
+                chain = ExistingTreeLocator.locate_node_chain(
+                    current_tree,
+                    PathParser.parse_json_path(plan.resolved_parent_path),
+                )
+                if plan.insert_index is not None and len(_ensure_children(chain[-1])) != plan.insert_index:
+                    should_reposition = True
+                elif not _validate_summary_against_tree(current_tree, plan.validation_summary):
+                    should_reposition = True
+            except PathError:
+                # parent path may not exist yet because it will be created during commit
+                should_reposition = False
+
+        active_plan = plan
+        repositioned = False
+        if should_reposition:
+            repositioned = True
+            logger.info("reposition triggered base=%s current=%s", plan.base_version, current_version)
+            rebuilt = build_insert_plan(
+                deepcopy(current_tree),
+                current_version,
+                plan.target_json_path,
+                plan.new_node,
+                origin_tree,
+            )
+            active_plan = rebuilt
+            if rebuilt.status != PlanStatus.OK:
+                return CommitResult(
+                    status=CommitStatus.CONFLICT,
+                    message=f"reposition failed: {rebuilt.message}",
+                    is_repositioned=True,
+                    is_exist=False,
+                    existing_path=None,
+                    existing_node=None,
+                    items=[],
+                    working_tree=deepcopy(current_tree),
+                    tree_version=current_version,
+                )
+
+        try:
+            build_result, final_parent, final_parent_path, _ = _resolve_target_parent(
+                current_tree,
+                origin_tree,
+                active_plan.target_json_path,
+            )
+        except Exception as exc:
+            return CommitResult(
+                status=CommitStatus.INSERT_FAILED,
+                message=str(exc),
+                is_repositioned=repositioned,
+                is_exist=False,
+                existing_path=None,
+                existing_node=None,
+                items=[],
+                working_tree=deepcopy(current_tree),
+                tree_version=current_version,
+            )
+
+        duplicate = Deduplicator.find_duplicate(final_parent, active_plan.new_node)
+        if duplicate is not None:
+            dup_node, dup_idx = duplicate
+            return CommitResult(
+                status=CommitStatus.SUCCESS,
+                message="node already exists",
+                is_repositioned=repositioned,
+                is_exist=True,
+                existing_path=_build_child_path(final_parent_path, dup_idx),
+                existing_node=dup_node,
+                items=[],
+                working_tree=deepcopy(current_tree),
+                tree_version=current_version,
+            )
+
+        insert_index = len(_ensure_children(final_parent))
+        _ensure_children(final_parent).append(deepcopy(active_plan.new_node))
+
+        new_version = TREE_STATE_MANAGER.set_current_in_lock(current_tree)
+        items = [*build_result.created_items, _build_insert_item(final_parent_path, final_parent, active_plan.new_node)]
+
+        return CommitResult(
+            status=CommitStatus.REPOSITIONED_AND_SUCCESS if repositioned else CommitStatus.SUCCESS,
+            message="inserted",
+            is_repositioned=repositioned,
+            is_exist=False,
+            existing_path=None,
+            existing_node=None,
+            items=items,
+            working_tree=deepcopy(current_tree),
+            tree_version=new_version,
+        )
 
 
 def plan_nodes_by_json_path(
@@ -230,55 +517,36 @@ def plan_nodes_by_json_path(
     origin_tree: dict[str, Any],
     target_tree: dict[str, Any],
 ) -> dict[str, Any]:
-    """
-    若节点已存在：
-      {"is_exist": True, "path": "$.a.children[0]", "node": {...}, "working_tree": {...}}
-
-    若节点不存在：
-      {"is_exist": False, "items": [{"path": <parent_path>, "node": {...}}, ...], "working_tree": {...}}
-    """
-    working_tree = deepcopy(target_tree)
     raw_json_path = node.get("json_path", "")
     payload_node = {k: deepcopy(v) for k, v in node.items() if k != "json_path"}
 
-    try:
-        parsed_path = PathParser.parse_json_path(raw_json_path)
-        existing_chain = ExistingTreeLocator.locate_node_chain(origin_tree, parsed_path)
-        build_result = TreeBuilder.build_path(working_tree, existing_chain)
+    snapshot_tree, base_version = TREE_STATE_MANAGER.get_snapshot(target_tree)
+    plan = build_insert_plan(snapshot_tree, base_version, raw_json_path, payload_node, origin_tree)
+    logger.info(
+        "plan built base_version=%s target=%s status=%s",
+        base_version,
+        raw_json_path,
+        plan.status.value,
+    )
 
-        final_parent, _, _ = InsertPositionResolver.resolve_insert_position(
-            build_result.candidate_parent_node,
-            build_result.ancestor_chain,
-        )
-        parent_index = next(
-            (i for i, ancestor in enumerate(build_result.ancestor_chain) if ancestor is final_parent),
-            0,
-        )
-        final_parent_path = build_result.ancestor_paths[parent_index]
+    commit = commit_insert_plan(plan, origin_tree)
 
-        duplicate = Deduplicator.find_duplicate(final_parent, payload_node)
-        if duplicate is not None:
-            dup_node, dup_idx = duplicate
-            return _build_exist_result(final_parent_path, dup_node, dup_idx, working_tree)
+    if commit.is_exist:
+        return {
+            "is_exist": True,
+            "path": commit.existing_path,
+            "node": commit.existing_node,
+            "working_tree": commit.working_tree,
+            "commit_status": commit.status.value,
+            "message": commit.message,
+            "tree_version": commit.tree_version,
+        }
 
-        insert_item = _build_insert_item(final_parent_path, final_parent, payload_node)
-        _ensure_children(final_parent).append(payload_node)
-
-        return _build_insert_list_result(
-            [
-                *build_result.created_items,
-                insert_item,
-            ],
-            working_tree,
-        )
-
-    except PathError:
-        root_path = f"$.{origin_tree.get('name', '')}"
-        duplicate = Deduplicator.find_duplicate(working_tree, payload_node)
-        if duplicate is not None:
-            dup_node, dup_idx = duplicate
-            return _build_exist_result(root_path, dup_node, dup_idx, working_tree)
-
-        insert_item = _build_insert_item(root_path, working_tree, payload_node)
-        _ensure_children(working_tree).append(payload_node)
-        return _build_insert_list_result([insert_item], working_tree)
+    return {
+        "is_exist": False,
+        "items": commit.items,
+        "working_tree": commit.working_tree,
+        "commit_status": commit.status.value,
+        "message": commit.message,
+        "tree_version": commit.tree_version,
+    }
