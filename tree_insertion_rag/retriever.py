@@ -167,8 +167,11 @@ class TreeInsertionRetriever:
             }
 
         best = ranked_candidates[0]
-        should_return_path = confidence != "low"
-        reason = best.reason if should_return_path else confidence_reason
+        should_return_path = confidence != "low" or resolved_action == SearchAction.ADD
+        if confidence == "low" and resolved_action == SearchAction.ADD:
+            reason = f"{confidence_reason}; fallback to top candidate for add"
+        else:
+            reason = best.reason if should_return_path else confidence_reason
         self.last_debug = {
             "query_text": query_text,
             "parsed_nodes": parsed_debug,
