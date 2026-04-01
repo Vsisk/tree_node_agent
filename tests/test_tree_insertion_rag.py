@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import unittest
 
-from tree_insertion_rag.candidate_builder import CandidateBuilder
-from tree_insertion_rag.models import SearchAction
-from tree_insertion_rag.retriever import TreeInsertionRetriever
-from tree_insertion_rag.tree_parser import TreeParser
+from tree_insertion_rag.parser import TreeParser
+from tree_insertion_rag.ranker import Ranker
+from tree_insertion_rag.selector import TreeInsertionSelector
+
+
+class StubEmbeddingModel:
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        vocabulary = ["basic", "fee", "appendix", "remark", "tax", "amount", "invoice", "service", "date"]
+        vectors: list[list[float]] = []
+        for text in texts:
+            lowered = text.lower()
+            vectors.append([float(lowered.count(token)) for token in vocabulary])
+        return vectors
 
 
 def sample_tree() -> dict:
@@ -14,22 +23,22 @@ def sample_tree() -> dict:
             "node_name": "mapping_content",
             "node_id": "root",
             "node_type": "parent",
-            "annotation": "票据结构映射根节点",
+            "annotation": "invoice mapping root",
             "children": [
                 {
-                    "node_name": "基础信息",
+                    "node_name": "basic_info",
                     "node_id": "p_basic",
                     "node_type": "parent",
-                    "annotation": "发票基础抬头和编号信息",
+                    "annotation": "invoice header information",
                     "children": [
                         {
-                            "node_name": "发票号码",
+                            "node_name": "invoice_no",
                             "node_id": "l_invoice_no",
                             "node_type": "leaf",
                             "annotation": "invoice number",
                         },
                         {
-                            "node_name": "开票日期",
+                            "node_name": "invoice_date",
                             "node_id": "l_invoice_date",
                             "node_type": "leaf",
                             "annotation": "invoice issue date",
@@ -37,36 +46,36 @@ def sample_tree() -> dict:
                     ],
                 },
                 {
-                    "node_name": "费用明细",
+                    "node_name": "fee_detail",
                     "node_id": "p_fee",
                     "node_type": "parent",
-                    "annotation": "金额、税费和收费项目容器",
+                    "annotation": "amount and tax fields",
                     "children": [
                         {
-                            "node_name": "金额",
+                            "node_name": "amount",
                             "node_id": "l_amount",
                             "node_type": "leaf",
-                            "annotation": "总金额",
+                            "annotation": "total amount",
                         },
                         {
-                            "node_name": "税额",
+                            "node_name": "tax",
                             "node_id": "l_tax",
                             "node_type": "leaf",
-                            "annotation": "税费金额",
+                            "annotation": "tax amount",
                         },
                     ],
                 },
                 {
-                    "node_name": "附录",
+                    "node_name": "appendix",
                     "node_id": "p_appendix",
                     "node_type": "parent",
-                    "annotation": "备注和补充材料",
+                    "annotation": "remarks and attachments",
                     "children": [
                         {
-                            "node_name": "备注",
+                            "node_name": "remark",
                             "node_id": "l_remark",
                             "node_type": "leaf",
-                            "annotation": "业务备注",
+                            "annotation": "business remark",
                         }
                     ],
                 },
@@ -75,11 +84,11 @@ def sample_tree() -> dict:
     }
 
 
-class TreeInsertionRetrieverTest(unittest.TestCase):
+class TreeInsertionSelectorTest(unittest.TestCase):
     def setUp(self) -> None:
         self.parser = TreeParser()
-        self.builder = CandidateBuilder()
-        self.retriever = TreeInsertionRetriever()
+        self.ranker = Ranker(embedding_model=StubEmbeddingModel())
+        self.selector = TreeInsertionSelector(ranker=self.ranker)
 
     def test_jsonpath_generation(self) -> None:
         parsed_nodes = self.parser.parse(sample_tree())
@@ -88,93 +97,84 @@ class TreeInsertionRetrieverTest(unittest.TestCase):
         self.assertEqual(path_map["p_basic"], "$.mapping_content.children[0]")
         self.assertEqual(path_map["l_tax"], "$.mapping_content.children[1].children[1]")
 
-    def test_candidates_only_include_parent_nodes(self) -> None:
-        parsed_nodes = self.parser.parse(sample_tree())
-        candidates = self.builder.build(parsed_nodes)
-        self.assertTrue(candidates)
-        self.assertTrue(all(candidate.node_type == "parent" for candidate in candidates))
-        self.assertNotIn("l_tax", {candidate.node_id for candidate in candidates})
-
-    def test_modify_candidates_include_leaf_nodes(self) -> None:
-        parsed_nodes = self.parser.parse(sample_tree())
-        candidates = self.builder.build(parsed_nodes, action=SearchAction.MODIFY)
-        self.assertIn("l_tax", {candidate.node_id for candidate in candidates})
-
-    def test_leaf_node_will_not_be_returned(self) -> None:
-        result = self.retriever.find_best_node(
-            tree=sample_tree(),
-            node={
-                "node_name": "服务费",
+    def test_add_only_ranks_parent_candidates(self) -> None:
+        ranked = self.ranker.rank(
+            parsed_nodes=self.parser.parse(sample_tree()),
+            query="service fee belongs with amount and tax",
+            action="add",
+            target_node={
+                "node_name": "service_fee",
                 "node_id": "n_service_fee",
                 "node_type": "leaf",
-                "annotation": "订单服务费金额",
+                "annotation": "service fee amount",
             },
-            query="该字段属于费用明细，和金额、税额同级。",
+            topk=5,
+        )
+        self.assertTrue(ranked)
+        self.assertTrue(all(item.candidate.node_type == "parent" for item in ranked))
+
+    def test_add_returns_expected_parent_jsonpath(self) -> None:
+        result = self.selector.find_best_node(
+            tree=sample_tree(),
+            node={
+                "node_name": "service_fee",
+                "node_id": "n_service_fee",
+                "node_type": "leaf",
+                "annotation": "service fee amount",
+            },
+            query="service fee belongs with amount and tax",
             action="add",
             topk=5,
         )
-        self.assertEqual(result["jsonpath"], "$.mapping_content.children[1]")
-        self.assertNotEqual(result["jsonpath"], "$.mapping_content.children[1].children[0]")
-        self.assertEqual(result["matched_node_id"], "p_fee")
+        self.assertEqual(result, "$.mapping_content.children[1]")
 
-    def test_query_hits_expected_parent(self) -> None:
-        result = self.retriever.find_best_node(
+    def test_modify_can_return_leaf_jsonpath(self) -> None:
+        result = self.selector.find_best_node(
             tree=sample_tree(),
             node={
-                "node_name": "税率",
-                "node_id": "n_tax_rate",
+                "node_name": "tax",
+                "node_id": "n_tax_alias",
                 "node_type": "leaf",
-                "annotation": "税费比例",
+                "annotation": "tax amount field",
             },
-            query="这个字段属于费用明细模块，和金额、税额一组，表示税费相关信息。",
-            action="add",
-            topk=5,
-        )
-        self.assertEqual(result["jsonpath"], "$.mapping_content.children[1]")
-        self.assertIn(result["confidence"], {"medium", "high"})
-
-    def test_low_confidence_returns_none(self) -> None:
-        result = self.retriever.find_best_node(
-            tree=sample_tree(),
-            node={
-                "node_name": "日志级别",
-                "node_id": "n_log_level",
-                "node_type": "leaf",
-                "annotation": "系统运行时调试开关",
-            },
-            query="这是一个和当前票据结构无关的系统日志配置项。",
-            action="add",
-            topk=5,
-        )
-        self.assertIsNone(result["jsonpath"])
-        self.assertIsNone(result["matched_node_id"])
-        self.assertEqual(result["confidence"], "low")
-
-    def test_modify_can_hit_leaf_node(self) -> None:
-        result = self.retriever.find_best_node(
-            tree=sample_tree(),
-            node={
-                "node_name": "税额",
-                "node_id": "n_new_tax_alias",
-                "node_type": "leaf",
-                "annotation": "税费金额字段",
-            },
-            query="请修改税额字段的名称和说明。",
+            query="modify the tax field",
             action="modify",
             topk=5,
         )
-        self.assertEqual(result["jsonpath"], "$.mapping_content.children[1].children[1]")
-        self.assertEqual(result["matched_node_id"], "l_tax")
+        self.assertEqual(result, "$.mapping_content.children[1].children[1]")
 
     def test_delete_can_work_without_node_payload(self) -> None:
-        result = self.retriever.find_best_node(
+        result = self.selector.find_best_node(
             tree=sample_tree(),
-            query="删除附录下面的备注节点。",
+            query="delete the remark under appendix",
             action="delete",
             topk=5,
         )
-        self.assertEqual(result["jsonpath"], "$.mapping_content.children[2].children[0]")
-        self.assertEqual(result["matched_node_id"], "l_remark")
+        self.assertEqual(result, "$.mapping_content.children[2].children[0]")
+
+    def test_llm_selector_can_override_ranker_top1(self) -> None:
+        class StubLLMSelector:
+            def select(self, query, action, target_node, ranked_candidates):
+                del query, action, target_node
+                return next(item for item in ranked_candidates if item.candidate.node_id == "p_appendix")
+
+        selector = TreeInsertionSelector(
+            ranker=Ranker(embedding_model=StubEmbeddingModel()),
+            candidate_selector=StubLLMSelector(),
+        )
+        result = selector.find_best_node(
+            tree=sample_tree(),
+            node={
+                "node_name": "attachment_desc",
+                "node_id": "n_attachment_desc",
+                "node_type": "leaf",
+                "annotation": "attachment description",
+            },
+            query="attachment details should go to appendix",
+            action="add",
+            topk=5,
+        )
+        self.assertEqual(result, "$.mapping_content.children[2]")
 
 
 if __name__ == "__main__":
