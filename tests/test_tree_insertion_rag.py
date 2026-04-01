@@ -133,7 +133,7 @@ class TreeInsertionRetrieverTest(unittest.TestCase):
         self.assertEqual(result["jsonpath"], "$.mapping_content.children[1]")
         self.assertIn(result["confidence"], {"medium", "high"})
 
-    def test_low_confidence_returns_none(self) -> None:
+    def test_add_low_confidence_returns_fallback_path(self) -> None:
         result = self.retriever.find_best_node(
             tree=sample_tree(),
             node={
@@ -146,8 +146,8 @@ class TreeInsertionRetrieverTest(unittest.TestCase):
             action="add",
             topk=5,
         )
-        self.assertIsNone(result["jsonpath"])
-        self.assertIsNone(result["matched_node_id"])
+        self.assertIsNotNone(result["jsonpath"])
+        self.assertIsNotNone(result["matched_node_id"])
         self.assertEqual(result["confidence"], "low")
 
     def test_modify_can_hit_leaf_node(self) -> None:
