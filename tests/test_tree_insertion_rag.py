@@ -4,6 +4,7 @@ import unittest
 
 from tree_insertion_rag.parser import TreeParser
 from tree_insertion_rag.ranker import Ranker
+from tree_insertion_rag.logger import logger as tree_logger
 from tree_insertion_rag.selector import TreeInsertionSelector
 
 
@@ -175,6 +176,29 @@ class TreeInsertionSelectorTest(unittest.TestCase):
             topk=5,
         )
         self.assertEqual(result, "$.mapping_content.children[2]")
+
+    def test_logs_parser_rank_and_selector_stages(self) -> None:
+        with self.assertLogs(tree_logger, level="INFO") as captured:
+            result = self.selector.find_best_node(
+                tree=sample_tree(),
+                node={
+                    "node_name": "service_fee",
+                    "node_id": "n_service_fee",
+                    "node_type": "leaf",
+                    "annotation": "service fee amount",
+                },
+                query="service fee belongs with amount and tax",
+                action="add",
+                topk=5,
+            )
+
+        self.assertEqual(result, "$.mapping_content.children[1]")
+        joined = "\n".join(captured.output)
+        self.assertIn("stage=parser", joined)
+        self.assertIn("stage=rank", joined)
+        self.assertIn("stage=selector", joined)
+        self.assertIn("elapsed_ms=", joined)
+        self.assertIn("\"jsonpath\": \"$.mapping_content.children[1]\"", joined)
 
 
 if __name__ == "__main__":

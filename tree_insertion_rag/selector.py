@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+from time import perf_counter
 from typing import Any, Protocol
 
+from tree_insertion_rag.logger import (
+    log_stage,
+    summarize_parsed_nodes,
+    summarize_ranked_candidates,
+    summarize_selection,
+)
 from tree_insertion_rag.parser import TreeInsertionError, TreeParser
 from tree_insertion_rag.ranker import Ranker, RankedCandidate
 
@@ -101,7 +108,15 @@ class TreeInsertionSelector:
         if normalized_action == "add" and node is None:
             raise TreeInsertionError("node is required when action='add'")
 
+        parser_started_at = perf_counter()
         parsed_nodes = self.parser.parse(tree)
+        log_stage(
+            stage="parser",
+            elapsed_ms=(perf_counter() - parser_started_at) * 1000,
+            output=summarize_parsed_nodes(parsed_nodes),
+        )
+
+        rank_started_at = perf_counter()
         ranked_candidates = self.ranker.rank(
             parsed_nodes=parsed_nodes,
             query=query,
@@ -109,20 +124,47 @@ class TreeInsertionSelector:
             target_node=node,
             topk=topk,
         )
+        log_stage(
+            stage="rank",
+            elapsed_ms=(perf_counter() - rank_started_at) * 1000,
+            output=summarize_ranked_candidates(ranked_candidates),
+        )
         if not ranked_candidates:
+            log_stage(
+                stage="selector",
+                elapsed_ms=0.0,
+                output=summarize_selection(selected=None, fallback=True),
+            )
             return None
 
         if self.candidate_selector is None:
+            log_stage(
+                stage="selector",
+                elapsed_ms=0.0,
+                output=summarize_selection(selected=ranked_candidates[0], fallback=True),
+            )
             return ranked_candidates[0].candidate.jsonpath
 
+        selector_started_at = perf_counter()
         selected = self.candidate_selector.select(
             query=query,
             action=normalized_action,
             target_node=node,
             ranked_candidates=ranked_candidates,
         )
+        elapsed_ms = (perf_counter() - selector_started_at) * 1000
         if selected is None:
+            log_stage(
+                stage="selector",
+                elapsed_ms=elapsed_ms,
+                output=summarize_selection(selected=ranked_candidates[0], fallback=True),
+            )
             return ranked_candidates[0].candidate.jsonpath
+        log_stage(
+            stage="selector",
+            elapsed_ms=elapsed_ms,
+            output=summarize_selection(selected=selected, fallback=False),
+        )
         return selected.candidate.jsonpath
 
     def find_best_parent(
